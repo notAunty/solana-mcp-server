@@ -2,6 +2,8 @@
 
 A Model Context Protocol (MCP) server that provides comprehensive access to Solana blockchain data through Cline. This server implements a wide range of Solana RPC methods, making it easy to query blockchain information directly through natural language conversations.
 
+<a href="https://glama.ai/mcp/servers/bp6d6p1sp3"><img width="380" height="200" src="https://glama.ai/mcp/servers/bp6d6p1sp3/badge" alt="solana-mcp-server MCP server" /></a>
+
 ## Features
 
 The server provides 21 essential Solana RPC methods across different categories:
