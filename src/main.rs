@@ -5,11 +5,12 @@ use mcp_sdk::{
     transport::{StdioTransport, JsonRpcMessage, Transport, JsonRpcResponse, JsonRpcVersion},
     types::{
         CallToolRequest, CallToolResponse, ToolResponseContent,
-        ResourceContents, ReadResourceRequest,
+        ResourceContents,
     },
     server::{Server, ServerOptions},
     protocol::ProtocolBuilder,
 };
+use solana_mcp_server::ReadResourceRequest;
 // ... (rest of the imports remain the same)
 
 // ... (rest of the code remains the same until Transport impl)
@@ -77,7 +78,8 @@ async fn main() -> Result<()> {
     let options = ServerOptions::default();
     
     info!("Starting Solana MCP server...");
-    Server::new(protocol, options).execute(transport).await?;
+    let server = Server::new(protocol, options);
+    server.run(transport).await?;
     
     Ok(())
 }
