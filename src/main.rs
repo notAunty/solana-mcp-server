@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     
     info!("Starting Solana MCP server...");
     let server = Server::new(protocol, options);
-    server.run(transport).await?;
+    server.execute(transport).await?;
     
     Ok(())
 }
