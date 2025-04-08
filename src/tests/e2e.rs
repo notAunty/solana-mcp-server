@@ -1,8 +1,9 @@
 use super::*;
+use crate::ReadResourceRequest;
 use mcp_sdk::{
     transport::{
         StdioTransport, JsonRpcMessage, Transport, JsonRpcRequest, JsonRpcResponse,
-        ReadResourceRequest, JsonRpcVersion,
+        JsonRpcVersion,
     },
     types::{
         CallToolRequest, CallToolResponse, ToolResponseContent,
