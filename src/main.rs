@@ -1,38 +1,32 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use log::{error, info, warn};
 use mcp_sdk::{
-    transport::{Transport, JsonRpcMessage, StdioTransport}, 
     types::{
-        CallToolRequest, CallToolResponse, Tool, ToolResponseContent, ErrorCode,
-        Resource, ResourceContents, ListResourcesRequest, ListResourceTemplatesRequest,
-        ReadResourceRequest, ResourceContent, InitializationOptions, ServerCapabilities,
-        ResourceCapabilities,
+        CallToolRequest, CallToolResponse, Tool, ToolResponseContent,
     },
-    server::Server,
 };
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     pubkey::Pubkey,
 };
+use solana_transaction_status::UiTransactionEncoding;
 use std::{str::FromStr, time::{Duration, Instant}};
-use tokio::time::timeout;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::time::{timeout, sleep};
+use serde::{Deserialize, Serialize};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUESTS_PER_MINUTE: u32 = 60;
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-const CACHE_DURATION: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
-struct CachedResource {
-    content: Vec<ResourceContent>,
-    timestamp: Instant,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceTemplate {
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
 }
 
 struct CircuitBreaker {
@@ -82,24 +76,49 @@ struct SolanaMcpServer {
     rpc_client: RpcClient,
     request_count: std::sync::atomic::AtomicU32,
     last_reset: std::sync::Mutex<Instant>,
-    resources: Vec<Resource>,
-    resource_templates: Vec<ResourceTemplate>,
-    resource_cache: Arc<RwLock<HashMap<String, CachedResource>>>,
     circuit_breaker: CircuitBreaker,
-    transport: Arc<RwLock<Option<Box<dyn Transport>>>>,
 }
 
-#[async_trait]
-impl Server for SolanaMcpServer {
-    async fn connect(&self, transport: Box<dyn Transport>, options: InitializationOptions) -> Result<()> {
-        info!("Connecting with capabilities: {:?}", options.capabilities);
-        transport.open()?;
-        *self.transport.write().await = Some(transport);
-        Ok(())
-    }
-
-    async fn list_tools(&self) -> Result<Vec<Tool>> {
+impl SolanaMcpServer {
+    pub async fn list_tools(&self) -> Result<Vec<Tool>> {
         Ok(vec![
+            Tool {
+                name: "get_sol_balance".to_string(),
+                description: Some("Get SOL balance for an address".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "address": {
+                            "type": "string",
+                            "description": "Account public key"
+                        }
+                    },
+                    "required": ["address"]
+                }),
+            },
+            Tool {
+                name: "get_token_balance".to_string(),
+                description: Some("Get SPL token balance".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "address": {
+                            "type": "string",
+                            "description": "Token account public key"
+                        }
+                    },
+                    "required": ["address"]
+                }),
+            },
+            Tool {
+                name: "get_epoch_info".to_string(),
+                description: Some("Get current epoch information".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
             Tool {
                 name: "get_slot".to_string(),
                 description: Some("Get the current slot".to_string()),
@@ -318,80 +337,29 @@ impl Server for SolanaMcpServer {
             },
         ])
     }
-}
 
-impl SolanaMcpServer {
     fn new() -> Self {
         let circuit_breaker = CircuitBreaker::new(5, Duration::from_secs(60));
-        let resource_cache = Arc::new(RwLock::new(HashMap::new()));
-        let transport = Arc::new(RwLock::new(None));
         let rpc_url = std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| String::from("https://api.mainnet-beta.solana.com"));
         
         info!("Initializing Solana MCP server with RPC URL: {}", rpc_url);
         
-        let resources = vec![
-            Resource {
-                uri: "solana://supply".to_string(),
-                name: "Current Supply".to_string(),
-                description: Some("Current circulating supply information".to_string()),
-                mime_type: Some("application/json".to_string()),
-            },
-            Resource {
-                uri: "solana://inflation".to_string(),
-                name: "Inflation Rate".to_string(),
-                description: Some("Current inflation rate information".to_string()),
-                mime_type: Some("application/json".to_string()),
-            },
-        ];
-
-        let resource_templates = vec![
-            ResourceTemplate {
-                uri_template: "solana://accounts/{address}".to_string(),
-                name: "Account Information".to_string(),
-                description: Some("Get information about a Solana account".to_string()),
-                mime_type: Some("application/json".to_string()),
-            },
-            ResourceTemplate {
-                uri_template: "solana://transactions/{signature}".to_string(),
-                name: "Transaction Information".to_string(),
-                description: Some("Get information about a transaction".to_string()),
-                mime_type: Some("application/json".to_string()),
-            },
-            ResourceTemplate {
-                uri_template: "solana://blocks/{slot}".to_string(),
-                name: "Block Information".to_string(),
-                description: Some("Get information about a block".to_string()),
-                mime_type: Some("application/json".to_string()),
-            },
-            ResourceTemplate {
-                uri_template: "solana://tokens/{mint}/supply".to_string(),
-                name: "Token Supply".to_string(),
-                description: Some("Get supply information for a token".to_string()),
-                mime_type: Some("application/json".to_string()),
-            },
-        ];
-        
         Self {
             rpc_client: RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed()),
             request_count: std::sync::atomic::AtomicU32::new(0),
             last_reset: std::sync::Mutex::new(Instant::now()),
-            resources,
-            resource_templates,
-            resource_cache,
             circuit_breaker,
-            transport,
         }
     }
 
-    async fn retry_with_backoff<F, T>(&self, future: F) -> Result<T>
+    async fn retry_with_backoff<F, T>(&self, mut operation: F) -> Result<T>
     where
-        F: std::future::Future<Output = Result<T>> + Clone,
+        F: FnMut() -> Result<T>,
     {
         let mut retries = 0;
         loop {
-            let future_clone = future.clone();
-            match future_clone.await {
+            match operation() {
                 Ok(result) => {
                     self.circuit_breaker.reset();
                     return Ok(result);
@@ -409,14 +377,6 @@ impl SolanaMcpServer {
                 }
             }
         }
-    }
-
-    async fn update_cache(&self, uri: &str, content: Vec<ResourceContent>) {
-        let mut cache = self.resource_cache.write().await;
-        cache.insert(uri.to_string(), CachedResource {
-            content,
-            timestamp: Instant::now(),
-        });
     }
 
     fn check_rate_limit(&self) -> Result<()> {
@@ -438,144 +398,7 @@ impl SolanaMcpServer {
         Ok(())
     }
 
-    async fn handle_read_resource(&self, request: ReadResourceRequest) -> Result<Vec<ResourceContent>> {
-        if self.circuit_breaker.is_open() {
-            return Err(anyhow::anyhow!("Service temporarily unavailable"));
-        }
-
-        let uri = request.uri.as_str();
-        
-        // Check cache first
-        if let Some(cached) = self.resource_cache.read().await.get(uri) {
-            if cached.timestamp.elapsed() < CACHE_DURATION {
-                return Ok(cached.content.clone());
-            }
-        }
-        
-        // If not in cache or expired, fetch fresh data
-        let result = match uri {
-            "solana://supply" => {
-                let supply = self.retry_with_backoff(async {
-                    let supply = self.rpc_client.get_supply()?;
-                    Ok(serde_json::to_string(&supply)?)
-                }).await?;
-                
-                let content = vec![ResourceContent {
-                    uri: uri.to_string(),
-                    text: Some(supply),
-                    blob: None,
-                    mime_type: Some("application/json".to_string()),
-                }];
-                self.update_cache(uri, content.clone()).await;
-                Ok(content)
-            }
-            "solana://inflation" => {
-                let rate = self.retry_with_backoff(async {
-                    let rate = self.rpc_client.get_inflation_rate()?;
-                    Ok(serde_json::to_string(&rate)?)
-                }).await?;
-                
-                let content = vec![ResourceContent {
-                    uri: uri.to_string(),
-                    text: Some(rate),
-                    blob: None,
-                    mime_type: Some("application/json".to_string()),
-                }];
-                self.update_cache(uri, content.clone()).await;
-                Ok(content)
-            }
-            _ => {
-                // Handle dynamic resources
-                if uri.starts_with("solana://accounts/") {
-                    let address = uri.strip_prefix("solana://accounts/").unwrap();
-                    let pubkey = Pubkey::from_str(address)
-                        .map_err(|_| anyhow::anyhow!("Invalid account address"))?;
-                    
-                    let info = self.retry_with_backoff(async {
-                        let account = self.rpc_client.get_account(&pubkey)?;
-                        Ok(serde_json::to_string(&account)?)
-                    }).await?;
-                    
-                    let content = vec![ResourceContent {
-                        uri: uri.to_string(),
-                        text: Some(info),
-                        blob: None,
-                        mime_type: Some("application/json".to_string()),
-                    }];
-                    self.update_cache(uri, content.clone()).await;
-                    Ok(content)
-                } else if uri.starts_with("solana://transactions/") {
-                    let signature = uri.strip_prefix("solana://transactions/").unwrap();
-                    
-                    let tx_info = self.retry_with_backoff(async {
-                        let sig = signature.parse()
-                            .map_err(|_| anyhow::anyhow!("Invalid transaction signature"))?;
-                        let tx = self.rpc_client.get_transaction(&sig, None)?;
-                        Ok(serde_json::to_string(&tx)?)
-                    }).await?;
-                    
-                    let content = vec![ResourceContent {
-                        uri: uri.to_string(),
-                        text: Some(tx_info),
-                        blob: None,
-                        mime_type: Some("application/json".to_string()),
-                    }];
-                    self.update_cache(uri, content.clone()).await;
-                    Ok(content)
-                } else if uri.starts_with("solana://blocks/") {
-                    let slot = uri.strip_prefix("solana://blocks/").unwrap()
-                        .parse::<u64>()
-                        .map_err(|_| anyhow::anyhow!("Invalid slot number"))?;
-                    
-                    let block_info = self.retry_with_backoff(async {
-                        let block = self.rpc_client.get_block(slot)?;
-                        Ok(serde_json::to_string(&block)?)
-                    }).await?;
-                    
-                    let content = vec![ResourceContent {
-                        uri: uri.to_string(),
-                        text: Some(block_info),
-                        blob: None,
-                        mime_type: Some("application/json".to_string()),
-                    }];
-                    self.update_cache(uri, content.clone()).await;
-                    Ok(content)
-                } else if uri.starts_with("solana://tokens/") {
-                    let parts: Vec<&str> = uri.strip_prefix("solana://tokens/").unwrap().split('/').collect();
-                    if parts.len() == 2 && parts[1] == "supply" {
-                        let mint = Pubkey::from_str(parts[0])
-                            .map_err(|_| anyhow::anyhow!("Invalid mint address"))?;
-                        
-                        let supply = self.retry_with_backoff(async {
-                            let supply = self.rpc_client.get_token_supply(&mint)?;
-                            Ok(serde_json::to_string(&supply)?)
-                        }).await?;
-                        
-                        let content = vec![ResourceContent {
-                            uri: uri.to_string(),
-                            text: Some(supply),
-                            blob: None,
-                            mime_type: Some("application/json".to_string()),
-                        }];
-                        self.update_cache(uri, content.clone()).await;
-                        Ok(content)
-                    } else {
-                        Err(anyhow::anyhow!("Invalid token resource URI"))
-                    }
-                } else {
-                    Err(anyhow::anyhow!("Resource not found"))
-                }
-            }
-        };
-
-        if result.is_err() && self.circuit_breaker.record_failure() {
-            error!("Circuit breaker opened due to too many failures");
-        }
-
-        result
-    }
-
-    async fn handle_request(&self, request: CallToolRequest) -> Result<CallToolResponse> {
+    pub async fn handle_tool_request(&self, request: CallToolRequest) -> Result<CallToolResponse> {
         if self.circuit_breaker.is_open() {
             return Err(anyhow::anyhow!("Service temporarily unavailable"));
         }
@@ -583,17 +406,18 @@ impl SolanaMcpServer {
         // Check rate limit first
         self.check_rate_limit()?;
 
+        let tool_name = request.name.clone();
         let start_time = Instant::now();
-        let result = timeout(REQUEST_TIMEOUT, self.handle_tool_request(request.clone())).await;
+        let result = timeout(REQUEST_TIMEOUT, self.process_tool_request(request)).await;
         let duration = start_time.elapsed();
 
         match result {
             Ok(response) => {
-                info!("Tool {} executed successfully in {:?}", request.name, duration);
+                info!("Tool {} executed successfully in {:?}", tool_name, duration);
                 response
             }
             Err(_) => {
-                error!("Tool {} timed out after {:?}", request.name, duration);
+                error!("Tool {} timed out after {:?}", tool_name, duration);
                 if self.circuit_breaker.record_failure() {
                     error!("Circuit breaker opened due to timeout");
                 }
@@ -602,11 +426,72 @@ impl SolanaMcpServer {
         }
     }
 
-    async fn handle_tool_request(&self, request: CallToolRequest) -> Result<CallToolResponse> {
+    async fn process_tool_request(&self, request: CallToolRequest) -> Result<CallToolResponse> {
         match request.name.as_str() {
+            "get_sol_balance" => {
+                let address = request.arguments.as_ref()
+                    .and_then(|args| args.get("address"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing address parameter"))?;
+                
+                let pubkey = Pubkey::from_str(address)
+                    .map_err(|_| anyhow::anyhow!("Invalid account address"))?;
+                
+                let balance = self.retry_with_backoff(|| {
+                    self.rpc_client.get_balance(&pubkey)
+                        .map_err(|e| anyhow::anyhow!("Failed to get balance: {}", e))
+                }).await?;
+                
+                Ok(CallToolResponse {
+                    content: vec![ToolResponseContent::Text {
+                        text: format!("SOL balance: {} lamports ({:.9} SOL)", balance, balance as f64 / 1_000_000_000.0),
+                    }],
+                    is_error: Some(false),
+                    meta: None,
+                })
+            }
+            "get_token_balance" => {
+                let address = request.arguments.as_ref()
+                    .and_then(|args| args.get("address"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing address parameter"))?;
+                
+                let pubkey = Pubkey::from_str(address)
+                    .map_err(|_| anyhow::anyhow!("Invalid token account address"))?;
+                
+                let balance = self.retry_with_backoff(|| {
+                    let balance = self.rpc_client.get_token_account_balance(&pubkey)
+                        .map_err(|e| anyhow::anyhow!("Failed to get token balance: {}", e))?;
+                    Ok(serde_json::to_string(&balance)?)
+                }).await?;
+                
+                Ok(CallToolResponse {
+                    content: vec![ToolResponseContent::Text {
+                        text: format!("Token balance: {}", balance),
+                    }],
+                    is_error: Some(false),
+                    meta: None,
+                })
+            }
+            "get_epoch_info" => {
+                let epoch_info = self.retry_with_backoff(|| {
+                    let epoch = self.rpc_client.get_epoch_info()
+                        .map_err(|e| anyhow::anyhow!("Failed to get epoch info: {}", e))?;
+                    Ok(serde_json::to_string(&epoch)?)
+                }).await?;
+                
+                Ok(CallToolResponse {
+                    content: vec![ToolResponseContent::Text {
+                        text: format!("Epoch info: {}", epoch_info),
+                    }],
+                    is_error: Some(false),
+                    meta: None,
+                })
+            }
             "get_slot" => {
-                let slot = self.retry_with_backoff(async {
-                    Ok(self.rpc_client.get_slot()?)
+                let slot = self.retry_with_backoff(|| {
+                    self.rpc_client.get_slot()
+                        .map_err(|e| anyhow::anyhow!("Failed to get slot: {}", e))
                 }).await?;
                 
                 Ok(CallToolResponse {
@@ -623,13 +508,14 @@ impl SolanaMcpServer {
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| anyhow::anyhow!("Missing or invalid slot parameter"))?;
                 
-                let timestamp = self.retry_with_backoff(async {
-                    Ok(self.rpc_client.get_block_time(slot)?)
+                let timestamp = self.retry_with_backoff(|| {
+                    self.rpc_client.get_block_time(slot)
+                        .map_err(|e| anyhow::anyhow!("Failed to get block time: {}", e))
                 }).await?;
                 
                 Ok(CallToolResponse {
                     content: vec![ToolResponseContent::Text {
-                        text: format!("Block time: {} (Unix timestamp)", timestamp),
+                        text: format!("Block time: {:?} (Unix timestamp)", timestamp),
                     }],
                     is_error: Some(false),
                     meta: None,
@@ -641,10 +527,11 @@ impl SolanaMcpServer {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing signature parameter"))?;
                 
-                let tx_info = self.retry_with_backoff(async {
+                let tx_info = self.retry_with_backoff(|| {
                     let sig = signature.parse()
                         .map_err(|_| anyhow::anyhow!("Invalid transaction signature"))?;
-                    let tx = self.rpc_client.get_transaction(&sig, None)?;
+                    let tx = self.rpc_client.get_transaction(&sig, UiTransactionEncoding::Json)
+                        .map_err(|e| anyhow::anyhow!("Failed to get transaction: {}", e))?;
                     Ok(serde_json::to_string(&tx)?)
                 }).await?;
                 
@@ -662,8 +549,9 @@ impl SolanaMcpServer {
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| anyhow::anyhow!("Missing or invalid slot parameter"))?;
                 
-                let block_info = self.retry_with_backoff(async {
-                    let block = self.rpc_client.get_block(slot)?;
+                let block_info = self.retry_with_backoff(|| {
+                    let block = self.rpc_client.get_block(slot)
+                        .map_err(|e| anyhow::anyhow!("Failed to get block: {}", e))?;
                     Ok(serde_json::to_string(&block)?)
                 }).await?;
                 
@@ -684,8 +572,9 @@ impl SolanaMcpServer {
                 let pubkey = Pubkey::from_str(address)
                     .map_err(|_| anyhow::anyhow!("Invalid account address"))?;
                 
-                let info = self.retry_with_backoff(async {
-                    let account = self.rpc_client.get_account(&pubkey)?;
+                let info = self.retry_with_backoff(|| {
+                    let account = self.rpc_client.get_account(&pubkey)
+                        .map_err(|e| anyhow::anyhow!("Failed to get account: {}", e))?;
                     Ok(serde_json::to_string(&account)?)
                 }).await?;
                 
@@ -706,8 +595,9 @@ impl SolanaMcpServer {
                 let pubkey = Pubkey::from_str(program_id)
                     .map_err(|_| anyhow::anyhow!("Invalid program ID"))?;
                 
-                let accounts = self.retry_with_backoff(async {
-                    let accounts = self.rpc_client.get_program_accounts(&pubkey)?;
+                let accounts = self.retry_with_backoff(|| {
+                    let accounts = self.rpc_client.get_program_accounts(&pubkey)
+                        .map_err(|e| anyhow::anyhow!("Failed to get program accounts: {}", e))?;
                     Ok(serde_json::to_string(&accounts)?)
                 }).await?;
                 
@@ -720,11 +610,11 @@ impl SolanaMcpServer {
                 })
             }
             "get_recent_blockhash" => {
-                let info = self.retry_with_backoff(async {
-                    let (blockhash, fee_calculator) = self.rpc_client.get_recent_blockhash()?;
+                let info = self.retry_with_backoff(|| {
+                    let blockhash = self.rpc_client.get_latest_blockhash()
+                        .map_err(|e| anyhow::anyhow!("Failed to get latest blockhash: {}", e))?;
                     Ok(serde_json::to_string(&serde_json::json!({
                         "blockhash": blockhash.to_string(),
-                        "fee_calculator": fee_calculator
                     }))?)
                 }).await?;
                 
@@ -737,8 +627,9 @@ impl SolanaMcpServer {
                 })
             }
             "get_version" => {
-                let version = self.retry_with_backoff(async {
-                    let version = self.rpc_client.get_version()?;
+                let version = self.retry_with_backoff(|| {
+                    let version = self.rpc_client.get_version()
+                        .map_err(|e| anyhow::anyhow!("Failed to get version: {}", e))?;
                     Ok(serde_json::to_string(&version)?)
                 }).await?;
                 
@@ -751,7 +642,7 @@ impl SolanaMcpServer {
                 })
             }
             "get_health" => {
-                let health = self.retry_with_backoff(async {
+                let health = self.retry_with_backoff(|| {
                     match self.rpc_client.get_health() {
                         Ok(_) => Ok("ok".to_string()),
                         Err(e) => Ok(format!("error: {}", e))
@@ -772,8 +663,9 @@ impl SolanaMcpServer {
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| anyhow::anyhow!("Missing or invalid data_size parameter"))? as usize;
                 
-                let balance = self.retry_with_backoff(async {
-                    Ok(self.rpc_client.get_minimum_balance_for_rent_exemption(data_size)?)
+                let balance = self.retry_with_backoff(|| {
+                    self.rpc_client.get_minimum_balance_for_rent_exemption(data_size)
+                        .map_err(|e| anyhow::anyhow!("Failed to get minimum balance: {}", e))
                 }).await?;
                 
                 Ok(CallToolResponse {
@@ -785,8 +677,9 @@ impl SolanaMcpServer {
                 })
             }
             "get_supply" => {
-                let supply = self.retry_with_backoff(async {
-                    let supply = self.rpc_client.get_supply()?;
+                let supply = self.retry_with_backoff(|| {
+                    let supply = self.rpc_client.supply_with_commitment(CommitmentConfig::confirmed())
+                        .map_err(|e| anyhow::anyhow!("Failed to get supply: {}", e))?;
                     Ok(serde_json::to_string(&supply)?)
                 }).await?;
                 
@@ -799,8 +692,11 @@ impl SolanaMcpServer {
                 })
             }
             "get_largest_accounts" => {
-                let accounts = self.retry_with_backoff(async {
-                    let accounts = self.rpc_client.get_largest_accounts()?;
+                let accounts = self.retry_with_backoff(|| {
+                    let accounts = self.rpc_client.get_largest_accounts_with_config(
+                        solana_client::rpc_config::RpcLargestAccountsConfig::default()
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to get largest accounts: {}", e))?;
                     Ok(serde_json::to_string(&accounts)?)
                 }).await?;
                 
@@ -813,8 +709,9 @@ impl SolanaMcpServer {
                 })
             }
             "get_inflation_rate" => {
-                let rate = self.retry_with_backoff(async {
-                    let rate = self.rpc_client.get_inflation_rate()?;
+                let rate = self.retry_with_backoff(|| {
+                    let rate = self.rpc_client.get_inflation_rate()
+                        .map_err(|e| anyhow::anyhow!("Failed to get inflation rate: {}", e))?;
                     Ok(serde_json::to_string(&rate)?)
                 }).await?;
                 
@@ -827,8 +724,9 @@ impl SolanaMcpServer {
                 })
             }
             "get_cluster_nodes" => {
-                let nodes = self.retry_with_backoff(async {
-                    let nodes = self.rpc_client.get_cluster_nodes()?;
+                let nodes = self.retry_with_backoff(|| {
+                    let nodes = self.rpc_client.get_cluster_nodes()
+                        .map_err(|e| anyhow::anyhow!("Failed to get cluster nodes: {}", e))?;
                     Ok(serde_json::to_string(&nodes)?)
                 }).await?;
                 
@@ -849,11 +747,12 @@ impl SolanaMcpServer {
                 let pubkey = Pubkey::from_str(owner)
                     .map_err(|_| anyhow::anyhow!("Invalid owner address"))?;
                 
-                let accounts = self.retry_with_backoff(async {
+                let accounts = self.retry_with_backoff(|| {
                     let accounts = self.rpc_client.get_token_accounts_by_owner(
                         &pubkey,
-                        solana_client::rpc_config::RpcTokenAccountsFilter::ProgramId(spl_token::id()),
-                    )?;
+                        TokenAccountsFilter::ProgramId(spl_token::id()),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to get token accounts: {}", e))?;
                     Ok(serde_json::to_string(&accounts)?)
                 }).await?;
                 
@@ -874,11 +773,12 @@ impl SolanaMcpServer {
                 let pubkey = Pubkey::from_str(delegate)
                     .map_err(|_| anyhow::anyhow!("Invalid delegate address"))?;
                 
-                let accounts = self.retry_with_backoff(async {
+                let accounts = self.retry_with_backoff(|| {
                     let accounts = self.rpc_client.get_token_accounts_by_delegate(
                         &pubkey,
-                        solana_client::rpc_config::RpcTokenAccountsFilter::ProgramId(spl_token::id()),
-                    )?;
+                        TokenAccountsFilter::ProgramId(spl_token::id()),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to get delegated token accounts: {}", e))?;
                     Ok(serde_json::to_string(&accounts)?)
                 }).await?;
                 
@@ -899,8 +799,9 @@ impl SolanaMcpServer {
                 let pubkey = Pubkey::from_str(mint)
                     .map_err(|_| anyhow::anyhow!("Invalid mint address"))?;
                 
-                let supply = self.retry_with_backoff(async {
-                    let supply = self.rpc_client.get_token_supply(&pubkey)?;
+                let supply = self.retry_with_backoff(|| {
+                    let supply = self.rpc_client.get_token_supply(&pubkey)
+                        .map_err(|e| anyhow::anyhow!("Failed to get token supply: {}", e))?;
                     Ok(serde_json::to_string(&supply)?)
                 }).await?;
                 
@@ -913,8 +814,9 @@ impl SolanaMcpServer {
                 })
             }
             "get_vote_accounts" => {
-                let accounts = self.retry_with_backoff(async {
-                    let accounts = self.rpc_client.get_vote_accounts()?;
+                let accounts = self.retry_with_backoff(|| {
+                    let accounts = self.rpc_client.get_vote_accounts()
+                        .map_err(|e| anyhow::anyhow!("Failed to get vote accounts: {}", e))?;
                     Ok(serde_json::to_string(&accounts)?)
                 }).await?;
                 
@@ -927,8 +829,9 @@ impl SolanaMcpServer {
                 })
             }
             "get_leader_schedule" => {
-                let schedule = self.retry_with_backoff(async {
-                    let schedule = self.rpc_client.get_leader_schedule(None)?;
+                let schedule = self.retry_with_backoff(|| {
+                    let schedule = self.rpc_client.get_leader_schedule(None)
+                        .map_err(|e| anyhow::anyhow!("Failed to get leader schedule: {}", e))?;
                     Ok(serde_json::to_string(&schedule)?)
                 }).await?;
                 
@@ -945,91 +848,23 @@ impl SolanaMcpServer {
     }
 }
 
-#[async_trait]
-impl Transport for SolanaMcpServer {
-    fn send<'a>(&'a self, message: &'a JsonRpcMessage) -> Result<()> {
-        if let Some(transport) = &*self.transport.blocking_read() {
-            transport.send(message)
-        } else {
-            Err(anyhow::anyhow!("Transport not initialized"))
-        }
-    }
-
-    fn receive<'a>(&'a self) -> Result<JsonRpcMessage> {
-        if let Some(transport) = &*self.transport.blocking_read() {
-            transport.receive()
-        } else {
-            Err(anyhow::anyhow!("Transport not initialized"))
-        }
-    }
-
-    fn open(&self) -> Result<()> {
-        info!("Opening transport connection");
-        Ok(())
-    }
-
-    fn close(&self) -> Result<()> {
-        info!("Closing transport connection");
-        if let Some(transport) = &*self.transport.blocking_read() {
-            transport.close()?;
-        }
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     env_logger::init();
     
     info!("Starting Solana MCP server");
     let server = SolanaMcpServer::new();
     
-    // Initialize transport with proper capabilities
-    let transport = StdioTransport::new();
-    
-    // Declare server capabilities
-    let initialization_options = InitializationOptions {
-        server_name: "solana-mcp-server".to_string(),
-        server_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: ServerCapabilities {
-            tools: Some(true),
-            resources: Some(ResourceCapabilities {
-                list_changed: Some(true),
-                templates: Some(true),
-            }),
-            prompts: None,
-            sampling: None,
-            roots: None,
-            experimental: None,
-        },
-    };
-    
-    info!("Solana MCP server running on stdio");
-    
-    // Connect transport with declared capabilities
-    if let Err(e) = server.connect(transport, initialization_options).await {
-        error!("Failed to connect transport: {}", e);
-        return Err(e.into());
+    let tools = server.list_tools().await?;
+    info!("Available tools:");
+    for tool in tools {
+        info!("  - {}: {}", tool.name, tool.description.unwrap_or("No description".to_string()));
     }
     
-    loop {
-        match server.receive() {
-            Ok(message) => {
-                if let Err(e) = server.send(&message) {
-                    error!("Error sending response: {}", e);
-                }
-            }
-            Err(e) => {
-                error!("Error receiving message: {}", e);
-                // Consider breaking the loop on fatal errors
-                if e.to_string().contains("EOF") {
-                    break;
-                }
-            }
-        }
-    }
-
-    info!("Shutting down Solana MCP server");
+    info!("Solana MCP server initialized with {} tools", 21);
+    
+    tokio::signal::ctrl_c().await?;
+    info!("Received shutdown signal, exiting...");
+    
     Ok(())
 }
