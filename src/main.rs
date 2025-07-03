@@ -1,9 +1,7 @@
 use anyhow::Result;
 use log::{error, info, warn};
-use mcp_sdk::{
-    types::{
-        CallToolRequest, CallToolResponse, Tool, ToolResponseContent,
-    },
+use mcp_sdk::types::{
+    CallToolRequest, CallToolResponse, Tool, ToolResponseContent,
 };
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_request::TokenAccountsFilter;
@@ -12,14 +10,63 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use solana_transaction_status::UiTransactionEncoding;
+use spl_token;
 use std::{str::FromStr, time::{Duration, Instant}};
 use tokio::time::{timeout, sleep};
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUESTS_PER_MINUTE: u32 = 60;
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    id: Value,
+    method: String,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JsonRpcError {
+    code: i32,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+}
+
+impl JsonRpcResponse {
+    fn success(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn error(id: Value, code: i32, message: String, data: Option<Value>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError { code, message, data }),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceTemplate {
@@ -862,9 +909,93 @@ async fn main() -> Result<()> {
     }
     
     info!("Solana MCP server initialized with {} tools", 21);
+    info!("MCP server listening on stdio...");
     
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, exiting...");
+    // Set up stdio transport for MCP
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut reader = BufReader::new(stdin);
+    let mut line = String::new();
     
+    // Main server loop
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF reached
+                info!("Received EOF, shutting down");
+                break;
+            }
+            Ok(_) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                
+                match serde_json::from_str::<JsonRpcRequest>(line) {
+                    Ok(request) => {
+                        let response = handle_request(&server, request).await;
+                        let response_json = serde_json::to_string(&response)?;
+                        stdout.write_all(response_json.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                    }
+                    Err(e) => {
+                        error!("Failed to parse JSON-RPC request: {}", e);
+                        let error_response = JsonRpcResponse::error(
+                            Value::Null,
+                            -32700,
+                            "Parse error".to_string(),
+                            Some(json!({"error": e.to_string()}))
+                        );
+                        let response_json = serde_json::to_string(&error_response)?;
+                        stdout.write_all(response_json.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read from stdin: {}", e);
+                break;
+            }
+        }
+    }
+    
+    info!("MCP server shutdown");
     Ok(())
+}
+
+async fn handle_request(server: &SolanaMcpServer, request: JsonRpcRequest) -> JsonRpcResponse {
+    match request.method.as_str() {
+        "tools/list" => {
+            match server.list_tools().await {
+                Ok(tools) => JsonRpcResponse::success(request.id, serde_json::to_value(tools).unwrap()),
+                Err(e) => JsonRpcResponse::error(request.id, -32603, e.to_string(), None),
+            }
+        }
+        "tools/call" => {
+            match request.params {
+                Some(params) => {
+                    match serde_json::from_value::<CallToolRequest>(params) {
+                        Ok(tool_request) => {
+                            match server.handle_tool_request(tool_request).await {
+                                Ok(response) => JsonRpcResponse::success(request.id, serde_json::to_value(response).unwrap()),
+                                Err(e) => JsonRpcResponse::error(request.id, -32603, e.to_string(), None),
+                            }
+                        }
+                        Err(e) => JsonRpcResponse::error(request.id, -32602, format!("Invalid tool request: {}", e), None),
+                    }
+                }
+                None => JsonRpcResponse::error(request.id, -32602, "Missing parameters".to_string(), None),
+            }
+        }
+        "initialize" => {
+            let capabilities = serde_json::json!({
+                "tools": {}
+            });
+            JsonRpcResponse::success(request.id, capabilities)
+        }
+        _ => JsonRpcResponse::error(request.id, -32601, format!("Method not found: {}", request.method), None),
+    }
 }
